@@ -341,8 +341,7 @@ class YoloNode(LifecycleNode):
             results = self.yolo(
                 cv_image
             )
-            self.get_logger().info(f"Results: {results[0]}")
-            return
+            # self.get_logger().info(f"Results: {results}")
             # self.enable = True
             # return
             results: Results = results[0].cpu()
