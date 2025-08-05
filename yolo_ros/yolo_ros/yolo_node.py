@@ -113,6 +113,10 @@ class YoloNode(LifecycleNode):
             self.get_parameter("image_reliability").get_parameter_value().integer_value
         )
 
+        self.wanted_classes = (
+            self.get_parameter("wanted_classes").get_parameter_value().integer_array_value
+        )
+
         # detection pub
         self.image_qos_profile = QoSProfile(
             reliability=self.reliability,
@@ -138,13 +142,7 @@ class YoloNode(LifecycleNode):
             self.get_logger().error(f"Model file '{self.model}' does not exists")
             return TransitionCallbackReturn.ERROR
 
-        # YOLOE does not support fusing
-        if isinstance(self.yolo, YOLO) or isinstance(self.yolo, YOLOWorld):
-            try:
-                self.get_logger().info("Trying to fuse model...")
-                self.yolo.fuse()
-            except TypeError as e:
-                self.get_logger().warn(f"Error while fuse: {e}")
+
 
         self._enable_srv = self.create_service(SetBool, "enable", self.enable_cb)
 
@@ -336,19 +334,8 @@ class YoloNode(LifecycleNode):
             cv_image = self.cv_bridge.imgmsg_to_cv2(
                 msg, desired_encoding=self.yolo_encoding
             )
-            results = self.yolo.predict(
-                source=cv_image,
-                verbose=False,
-                stream=False,
-                conf=self.threshold,
-                iou=self.iou,
-                imgsz=(self.imgsz_height, self.imgsz_width),
-                half=self.half,
-                max_det=self.max_det,
-                augment=self.augment,
-                agnostic_nms=self.agnostic_nms,
-                retina_masks=self.retina_masks,
-                device=self.device,
+            results = self.yolo(
+                cv_image
             )
             results: Results = results[0].cpu()
 
