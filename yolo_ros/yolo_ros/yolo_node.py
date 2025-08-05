@@ -67,7 +67,9 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("max_det", 300)
         self.declare_parameter("augment", False)
         self.declare_parameter("agnostic_nms", False)
-        self.declare_parameter("retina_masks", False)
+        self.declare_parameter("retina_masks", False)        
+        self.declare_parameter("wanted_classes", [0])
+
 
         self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld, "YOLOE": YOLOE}
 
