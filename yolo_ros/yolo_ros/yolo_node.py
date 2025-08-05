@@ -28,7 +28,7 @@ from rclpy.lifecycle import TransitionCallbackReturn
 from rclpy.lifecycle import LifecycleState
 
 import torch
-from ultralytics import YOLO, YOLOWorld
+from ultralytics import YOLO, YOLOWorld, YOLOE
 from ultralytics.engine.results import Results
 from ultralytics.engine.results import Boxes
 from ultralytics.engine.results import Masks
@@ -68,9 +68,8 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("augment", False)
         self.declare_parameter("agnostic_nms", False)
         self.declare_parameter("retina_masks", False)
-        self.declare_parameter("wanted_classes", [0])
 
-        self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld}
+        self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld, "YOLOE": YOLOE}
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Configuring...")
@@ -106,10 +105,6 @@ class YoloNode(LifecycleNode):
             self.get_parameter("retina_masks").get_parameter_value().bool_value
         )
 
-        self.wanted_classes = (
-            self.get_parameter("wanted_classes").get_parameter_value().integer_array_value
-        )
-
         # ros params
         self.enable = self.get_parameter("enable").get_parameter_value().bool_value
         self.reliability = (
@@ -141,11 +136,13 @@ class YoloNode(LifecycleNode):
             self.get_logger().error(f"Model file '{self.model}' does not exists")
             return TransitionCallbackReturn.ERROR
 
-        # try:
-        #     self.get_logger().info("Trying to fuse model...")
-        #     self.yolo.fuse()
-        # except TypeError as e:
-        #     self.get_logger().warn(f"Error while fuse: {e}")
+        # YOLOE does not support fusing
+        if isinstance(self.yolo, YOLO) or isinstance(self.yolo, YOLOWorld):
+            try:
+                self.get_logger().info("Trying to fuse model...")
+                self.yolo.fuse()
+            except TypeError as e:
+                self.get_logger().warn(f"Error while fuse: {e}")
 
         self._enable_srv = self.create_service(SetBool, "enable", self.enable_cb)
 
@@ -332,18 +329,25 @@ class YoloNode(LifecycleNode):
     def image_cb(self, msg: Image) -> None:
 
         if self.enable:
-            # self.enable = False  # disable to avoid multiple calls
 
             # convert image + predict
             cv_image = self.cv_bridge.imgmsg_to_cv2(
                 msg, desired_encoding=self.yolo_encoding
             )
-            results = self.yolo(
-                cv_image
+            results = self.yolo.predict(
+                source=cv_image,
+                verbose=False,
+                stream=False,
+                conf=self.threshold,
+                iou=self.iou,
+                imgsz=(self.imgsz_height, self.imgsz_width),
+                half=self.half,
+                max_det=self.max_det,
+                augment=self.augment,
+                agnostic_nms=self.agnostic_nms,
+                retina_masks=self.retina_masks,
+                device=self.device,
             )
-            # self.get_logger().info(f"Results: {results}")
-            # self.enable = True
-            # return
             results: Results = results[0].cpu()
 
             if results.boxes or results.obb:
@@ -401,6 +405,8 @@ def main():
     node = YoloNode()
     node.trigger_configure()
     node.trigger_activate()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
