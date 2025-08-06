@@ -134,6 +134,13 @@ def generate_launch_description():
             description="Whether to use high-resolution segmentation masks if available in the model, enhancing mask quality for segmentation",
         )
 
+        wanted_classes = LaunchConfiguration("wanted_classes")
+        wanted_classes_cmd = DeclareLaunchArgument(
+            "wanted_classes",
+            default_value="[0]",
+            description="List of class IDs to detect (e.g., [0, 1, 2] for person, bicycle, car). Empty list [] detects all classes.",
+        )
+
         input_image_topic = LaunchConfiguration("input_image_topic")
         input_image_topic_cmd = DeclareLaunchArgument(
             "input_image_topic",
@@ -247,6 +254,7 @@ def generate_launch_description():
                     "augment": augment,
                     "agnostic_nms": agnostic_nms,
                     "retina_masks": retina_masks,
+                    "wanted_classes": wanted_classes,
                     "image_reliability": image_reliability,
                 }
             ],
@@ -314,6 +322,7 @@ def generate_launch_description():
             augment_cmd,
             agnostic_nms_cmd,
             retina_masks_cmd,
+            wanted_classes_cmd,
             input_image_topic_cmd,
             image_reliability_cmd,
             input_depth_topic_cmd,

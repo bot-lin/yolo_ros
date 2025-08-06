@@ -342,17 +342,42 @@ class YoloNode(LifecycleNode):
             if results.boxes or results.obb:
                 hypothesis = self.parse_hypothesis(results)
                 boxes = self.parse_boxes(results)
+                
+                # Filter detections by wanted classes
+                if self.wanted_classes and len(self.wanted_classes) > 0:
+                    filtered_indices = []
+                    for i, hyp in enumerate(hypothesis):
+                        if hyp["class_id"] in self.wanted_classes:
+                            filtered_indices.append(i)
+                    
+                    hypothesis = [hypothesis[i] for i in filtered_indices]
+                    boxes = [boxes[i] for i in filtered_indices]
 
             if results.masks:
                 masks = self.parse_masks(results)
+                # Filter masks by wanted classes if filtering was applied
+                if self.wanted_classes and len(self.wanted_classes) > 0 and 'filtered_indices' in locals():
+                    masks = [masks[i] for i in filtered_indices]
 
             if results.keypoints:
                 keypoints = self.parse_keypoints(results)
+                # Filter keypoints by wanted classes if filtering was applied
+                if self.wanted_classes and len(self.wanted_classes) > 0 and 'filtered_indices' in locals():
+                    keypoints = [keypoints[i] for i in filtered_indices]
 
             # create detection msgs
             detections_msg = DetectionArray()
+            
+            # Determine the number of detections to process
+            num_detections = 0
+            if results.boxes or results.obb and hypothesis and boxes:
+                num_detections = len(hypothesis)
+            elif results.masks and masks:
+                num_detections = len(masks)
+            elif results.keypoints and keypoints:
+                num_detections = len(keypoints)
 
-            for i in range(len(results)):
+            for i in range(num_detections):
 
                 aux_msg = Detection()
 
