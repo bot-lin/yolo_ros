@@ -339,6 +339,40 @@ class YoloNode(LifecycleNode):
             )
             results: Results = results[0].cpu()
 
+            # Early exit if no wanted classes detected
+            if self.wanted_classes and len(self.wanted_classes) > 0:
+                if results.boxes or results.obb:
+                    # Check if any detection matches wanted classes
+                    has_wanted_class = False
+                    for box_data in (results.boxes if results.boxes else []):
+                        if int(box_data.cls) in self.wanted_classes:
+                            has_wanted_class = True
+                            break
+
+                    if results.obb and not has_wanted_class:
+                        for i in range(results.obb.cls.shape[0]):
+                            if int(results.obb.cls[i]) in self.wanted_classes:
+                                has_wanted_class = True
+                                break
+
+                    # Early exit if no wanted classes found
+                    if not has_wanted_class:
+                        # Publish empty detection array
+                        detections_msg = DetectionArray()
+                        detections_msg.header = msg.header
+                        self._pub.publish(detections_msg)
+                        del results
+                        del cv_image
+                        return
+                else:
+                    # No boxes/obb detected, publish empty and return
+                    detections_msg = DetectionArray()
+                    detections_msg.header = msg.header
+                    self._pub.publish(detections_msg)
+                    del results
+                    del cv_image
+                    return
+
             if results.boxes or results.obb:
                 hypothesis = self.parse_hypothesis(results)
                 boxes = self.parse_boxes(results)
