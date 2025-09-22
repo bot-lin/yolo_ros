@@ -334,6 +334,7 @@ class YoloNode(LifecycleNode):
             cv_image = self.cv_bridge.imgmsg_to_cv2(
                 msg, desired_encoding=self.yolo_encoding
             )
+            
             results = self.yolo(
                 cv_image
             )
@@ -342,6 +343,7 @@ class YoloNode(LifecycleNode):
             # Early exit if no wanted classes detected
             if self.wanted_classes and len(self.wanted_classes) > 0:
                 if results.boxes or results.obb:
+                    
                     # Check if any detection matches wanted classes
                     has_wanted_class = False
                     for box_data in (results.boxes if results.boxes else []):
@@ -349,11 +351,11 @@ class YoloNode(LifecycleNode):
                             has_wanted_class = True
                             break
 
-                    if results.obb and not has_wanted_class:
-                        for i in range(results.obb.cls.shape[0]):
-                            if int(results.obb.cls[i]) in self.wanted_classes:
-                                has_wanted_class = True
-                                break
+                    # if results.obb and not has_wanted_class:
+                    #     for i in range(results.obb.cls.shape[0]):
+                    #         if int(results.obb.cls[i]) in self.wanted_classes:
+                    #             has_wanted_class = True
+                    #             break
 
                     # Early exit if no wanted classes found
                     if not has_wanted_class:
