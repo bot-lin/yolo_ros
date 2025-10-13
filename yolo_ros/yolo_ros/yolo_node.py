@@ -60,6 +60,7 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
 
         self.declare_parameter("threshold", 0.5)
+        self.declare_parameter("confidence", 0.5)  # legacy
         self.declare_parameter("iou", 0.5)
         self.declare_parameter("imgsz_height", 640)
         self.declare_parameter("imgsz_width", 640)
@@ -90,6 +91,9 @@ class YoloNode(LifecycleNode):
         self.threshold = (
             self.get_parameter("threshold").get_parameter_value().double_value
         )
+        self.confidence = (
+            self.get_parameter("confidence").get_parameter_value().double_value
+        )  # legacy
         self.iou = self.get_parameter("iou").get_parameter_value().double_value
         self.imgsz_height = (
             self.get_parameter("imgsz_height").get_parameter_value().integer_value
@@ -383,7 +387,7 @@ class YoloNode(LifecycleNode):
                 if self.wanted_classes and len(self.wanted_classes) > 0:
                     filtered_indices = []
                     for i, hyp in enumerate(hypothesis):
-                        if hyp["class_id"] in self.wanted_classes:
+                        if hyp["class_id"] in self.wanted_classes and hyp['score'] >= self.confidence:
                             filtered_indices.append(i)
                     
                     hypothesis = [hypothesis[i] for i in filtered_indices]
