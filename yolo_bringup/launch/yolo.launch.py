@@ -186,6 +186,13 @@ def generate_launch_description():
             description="Specific reliability QoS of the input depth info topic (0=system default, 1=Reliable, 2=Best Effort)",
         )
 
+        input_pointcloud_topic = LaunchConfiguration("input_pointcloud_topic")
+        input_pointcloud_topic_cmd = DeclareLaunchArgument(
+            "input_pointcloud_topic",
+            default_value="/camera/depth/points",
+            description="Name of the input depth point cloud topic",
+        )
+
         target_frame = LaunchConfiguration("target_frame")
         target_frame_cmd = DeclareLaunchArgument(
             "target_frame",
@@ -288,6 +295,7 @@ def generate_launch_description():
             remappings=[
                 ("depth_image", input_depth_topic),
                 ("depth_info", input_depth_info_topic),
+                ("pointcloud", input_pointcloud_topic),
                 ("detections", detect_3d_detections_topic),
             ],
             condition=IfCondition(PythonExpression([str(use_3d)])),
@@ -329,6 +337,7 @@ def generate_launch_description():
             depth_image_reliability_cmd,
             input_depth_info_topic_cmd,
             depth_info_reliability_cmd,
+            input_pointcloud_topic_cmd,
             target_frame_cmd,
             depth_image_units_divisor_cmd,
             maximum_detection_threshold_cmd,

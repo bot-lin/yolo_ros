@@ -16,7 +16,7 @@
 
 import cv2
 import numpy as np
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import rclpy
 from rclpy.qos import QoSProfile
@@ -33,13 +33,16 @@ from tf2_ros.buffer import Buffer
 from tf2_ros import TransformException
 from tf2_ros.transform_listener import TransformListener
 
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from geometry_msgs.msg import TransformStamped
+from std_msgs.msg import Header
 from yolo_msgs.msg import Detection
 from yolo_msgs.msg import DetectionArray
 from yolo_msgs.msg import KeyPoint3D
 from yolo_msgs.msg import KeyPoint3DArray
 from yolo_msgs.msg import BoundingBox3D
+
+from sensor_msgs_py import point_cloud2
 
 
 class Detect3DNode(LifecycleNode):
@@ -59,6 +62,7 @@ class Detect3DNode(LifecycleNode):
         # aux
         self.tf_buffer = Buffer()
         self.cv_bridge = CvBridge()
+        self._warned_pointcloud_mismatch = False
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Configuring...")
@@ -105,6 +109,7 @@ class Detect3DNode(LifecycleNode):
 
         # pubs
         self._pub = self.create_publisher(DetectionArray, "detections_3d", 10)
+        self._pointcloud_pub = self.create_publisher(PointCloud2, "detections_pointcloud", 10)
 
         super().on_configure(state)
         self.get_logger().info(f"[{self.get_name()}] Configured")
@@ -121,12 +126,17 @@ class Detect3DNode(LifecycleNode):
         self.depth_info_sub = message_filters.Subscriber(
             self, CameraInfo, "depth_info", qos_profile=self.depth_info_qos_profile
         )
+        self.pointcloud_sub = message_filters.Subscriber(
+            self, PointCloud2, "pointcloud"
+        )
         self.detections_sub = message_filters.Subscriber(
             self, DetectionArray, "detections"
         )
 
         self._synchronizer = message_filters.ApproximateTimeSynchronizer(
-            (self.depth_sub, self.depth_info_sub, self.detections_sub), 10, 0.5
+            (self.depth_sub, self.depth_info_sub, self.pointcloud_sub, self.detections_sub),
+            10,
+            0.5,
         )
         self._synchronizer.registerCallback(self.on_detections)
 
@@ -140,6 +150,7 @@ class Detect3DNode(LifecycleNode):
 
         self.destroy_subscription(self.depth_sub.sub)
         self.destroy_subscription(self.depth_info_sub.sub)
+        self.destroy_subscription(self.pointcloud_sub.sub)
         self.destroy_subscription(self.detections_sub.sub)
 
         del self._synchronizer
@@ -155,6 +166,7 @@ class Detect3DNode(LifecycleNode):
         del self.tf_listener
 
         self.destroy_publisher(self._pub)
+        self.destroy_publisher(self._pointcloud_pub)
 
         super().on_cleanup(state)
         self.get_logger().info(f"[{self.get_name()}] Cleaned up")
@@ -169,65 +181,91 @@ class Detect3DNode(LifecycleNode):
         self,
         depth_msg: Image,
         depth_info_msg: CameraInfo,
+        pointcloud_msg: PointCloud2,
         detections_msg: DetectionArray,
     ) -> None:
 
         new_detections_msg = DetectionArray()
         new_detections_msg.header = detections_msg.header
-        new_detections_msg.detections = self.process_detections(
-            depth_msg, depth_info_msg, detections_msg
+        new_detections_msg.detections, points = self.process_detections(
+            depth_msg, depth_info_msg, pointcloud_msg, detections_msg
         )
         self._pub.publish(new_detections_msg)
+        pointcloud_msg = self.create_pointcloud_msg(
+            points, pointcloud_msg.header.stamp, self.target_frame
+        )
+        self._pointcloud_pub.publish(pointcloud_msg)
 
     def process_detections(
         self,
         depth_msg: Image,
         depth_info_msg: CameraInfo,
+        pointcloud_msg: PointCloud2,
         detections_msg: DetectionArray,
-    ) -> List[Detection]:
+    ) -> Tuple[List[Detection], np.ndarray]:
 
         # check if there are detections
         if not detections_msg.detections:
-            return []
+            return [], np.empty((0, 3), dtype=np.float32)
 
         transform = self.get_transform(depth_info_msg.header.frame_id)
 
         if transform is None:
-            return []
+            return [], np.empty((0, 3), dtype=np.float32)
 
         new_detections = []
+        aggregated_points: List[np.ndarray] = []
         depth_image = self.cv_bridge.imgmsg_to_cv2(
             depth_msg, desired_encoding="passthrough"
         )
 
         for detection in detections_msg.detections:
-            bbox3d = self.convert_bb_to_3d(depth_image, depth_info_msg, detection)
+            conversion = self.convert_bb_to_3d(depth_image, depth_info_msg, detection)
 
-            if bbox3d is not None:
-                new_detections.append(detection)
+            if conversion is None:
+                continue
 
-                bbox3d = Detect3DNode.transform_3d_box(bbox3d, transform[0], transform[1])
-                bbox3d.frame_id = self.target_frame
-                new_detections[-1].bbox3d = bbox3d
+            bbox3d, z_reference = conversion
 
-                if detection.keypoints.data:
-                    keypoints3d = self.convert_keypoints_to_3d(
-                        depth_image, depth_info_msg, detection
-                    )
-                    keypoints3d = Detect3DNode.transform_3d_keypoints(
-                        keypoints3d, transform[0], transform[1]
-                    )
-                    keypoints3d.frame_id = self.target_frame
-                    new_detections[-1].keypoints3d = keypoints3d
+            new_detections.append(detection)
 
-        return new_detections
+            bbox3d = Detect3DNode.transform_3d_box(bbox3d, transform[0], transform[1])
+            bbox3d.frame_id = self.target_frame
+            new_detections[-1].bbox3d = bbox3d
+
+            if detection.keypoints.data:
+                keypoints3d = self.convert_keypoints_to_3d(
+                    depth_image, depth_info_msg, detection
+                )
+                keypoints3d = Detect3DNode.transform_3d_keypoints(
+                    keypoints3d, transform[0], transform[1]
+                )
+                keypoints3d.frame_id = self.target_frame
+                new_detections[-1].keypoints3d = keypoints3d
+
+            detection_points = self.collect_detection_points(
+                depth_image, depth_info_msg, pointcloud_msg, detection, z_reference
+            )
+
+            if detection_points.size:
+                detection_points = Detect3DNode.transform_points(
+                    detection_points, transform[0], transform[1]
+                )
+                aggregated_points.append(detection_points)
+
+        if aggregated_points:
+            stacked_points = np.vstack(aggregated_points).astype(np.float32)
+        else:
+            stacked_points = np.empty((0, 3), dtype=np.float32)
+
+        return new_detections, stacked_points
 
     def convert_bb_to_3d(
         self,
         depth_image: np.ndarray,
         depth_info: CameraInfo,
         detection: Detection,
-    ) -> BoundingBox3D:
+    ) -> Optional[Tuple[BoundingBox3D, float]]:
 
         center_x = int(detection.bbox.center.position.x)
         center_y = int(detection.bbox.center.position.y)
@@ -295,7 +333,155 @@ class Detect3DNode(LifecycleNode):
         msg.size.y = h
         msg.size.z = float(z_max - z_min)
 
-        return msg
+        return msg, float(bb_center_z_coord)
+
+    def collect_detection_points(
+        self,
+        depth_image: np.ndarray,
+        depth_info: CameraInfo,
+        pointcloud_msg: PointCloud2,
+        detection: Detection,
+        z_reference: float,
+    ) -> np.ndarray:
+
+        height = pointcloud_msg.height
+        width = pointcloud_msg.width
+
+        if height <= 1 or width == 0:
+            return self._collect_points_from_depth(
+                depth_image, depth_info, detection, z_reference
+            )
+
+        if (
+            depth_image.shape[0] != height
+            or depth_image.shape[1] != width
+        ):
+            if not self._warned_pointcloud_mismatch:
+                self.get_logger().warn(
+                    "Point cloud dimensions do not match depth image, falling back to depth sampling."
+                )
+                self._warned_pointcloud_mismatch = True
+            return self._collect_points_from_depth(
+                depth_image, depth_info, detection, z_reference
+            )
+
+        if detection.mask.data:
+            mask_array = np.array(
+                [[int(ele.x), int(ele.y)] for ele in detection.mask.data]
+            )
+            mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillPoly(mask, [np.array(mask_array, dtype=np.int32)], 255)
+            rows, cols = np.nonzero(mask)
+        else:
+            center_x = int(detection.bbox.center.position.x)
+            center_y = int(detection.bbox.center.position.y)
+            size_x = int(detection.bbox.size.x)
+            size_y = int(detection.bbox.size.y)
+
+            u_min = max(center_x - size_x // 2, 0)
+            u_max = min(center_x + size_x // 2, width - 1)
+            v_min = max(center_y - size_y // 2, 0)
+            v_max = min(center_y + size_y // 2, height - 1)
+
+            if u_min >= u_max or v_min >= v_max:
+                return np.empty((0, 3), dtype=np.float32)
+
+            region_rows, region_cols = np.indices(
+                (v_max - v_min, u_max - u_min), dtype=np.int32
+            )
+            rows = (region_rows + v_min).reshape(-1)
+            cols = (region_cols + u_min).reshape(-1)
+
+        if rows.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        uvs = list(zip(cols.tolist(), rows.tolist()))
+
+        points_iter = point_cloud2.read_points(
+            pointcloud_msg, field_names=("x", "y", "z"), skip_nans=False, uvs=uvs
+        )
+        points = np.array(list(points_iter), dtype=np.float32)
+
+        if points.size == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        finite_mask = np.isfinite(points).all(axis=1)
+        if not np.any(finite_mask):
+            return np.empty((0, 3), dtype=np.float32)
+
+        points = points[finite_mask]
+
+        z_diff = np.abs(points[:, 2] - z_reference)
+        valid_mask = z_diff <= self.maximum_detection_threshold
+        if not np.any(valid_mask):
+            return np.empty((0, 3), dtype=np.float32)
+
+        return points[valid_mask]
+
+    def _collect_points_from_depth(
+        self,
+        depth_image: np.ndarray,
+        depth_info: CameraInfo,
+        detection: Detection,
+        z_reference: float,
+    ) -> np.ndarray:
+
+        depth_scale = self.depth_image_units_divisor
+        threshold = self.maximum_detection_threshold
+
+        if detection.mask.data:
+            mask_array = np.array(
+                [[int(ele.x), int(ele.y)] for ele in detection.mask.data]
+            )
+            mask = np.zeros(depth_image.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(mask, [np.array(mask_array, dtype=np.int32)], 255)
+            rows, cols = np.nonzero(mask)
+        else:
+            center_x = int(detection.bbox.center.position.x)
+            center_y = int(detection.bbox.center.position.y)
+            size_x = int(detection.bbox.size.x)
+            size_y = int(detection.bbox.size.y)
+
+            u_min = max(center_x - size_x // 2, 0)
+            u_max = min(center_x + size_x // 2, depth_image.shape[1] - 1)
+            v_min = max(center_y - size_y // 2, 0)
+            v_max = min(center_y + size_y // 2, depth_image.shape[0] - 1)
+
+            if u_min >= u_max or v_min >= v_max:
+                return np.empty((0, 3), dtype=np.float32)
+
+            region_rows, region_cols = np.indices(
+                (v_max - v_min, u_max - u_min), dtype=np.int32
+            )
+            rows = (region_rows + v_min).reshape(-1)
+            cols = (region_cols + u_min).reshape(-1)
+
+        depths = depth_image[rows, cols] / depth_scale
+        positive_mask = depths > 0
+        if not np.any(positive_mask):
+            return np.empty((0, 3), dtype=np.float32)
+
+        depths = depths[positive_mask]
+        rows = rows[positive_mask]
+        cols = cols[positive_mask]
+
+        z_diff = np.abs(depths - z_reference)
+        valid_mask = z_diff <= threshold
+        if not np.any(valid_mask):
+            return np.empty((0, 3), dtype=np.float32)
+
+        depths = depths[valid_mask]
+        rows = rows[valid_mask]
+        cols = cols[valid_mask]
+
+        k = depth_info.k
+        px, py, fx, fy = k[2], k[5], k[0], k[4]
+
+        x = depths * (cols - px) / fx
+        y = depths * (rows - py) / fy
+
+        points = np.stack((x, y, depths), axis=-1)
+        return points.astype(np.float32)
 
     def convert_keypoints_to_3d(
         self,
@@ -427,6 +613,23 @@ class Detect3DNode(LifecycleNode):
         return keypoints
 
     @staticmethod
+    def transform_points(
+        points: np.ndarray,
+        translation: np.ndarray,
+        rotation: np.ndarray,
+    ) -> np.ndarray:
+
+        if points.size == 0:
+            return points
+
+        transformed = [
+            Detect3DNode.qv_mult(rotation, point.astype(np.float64)) + translation
+            for point in points
+        ]
+
+        return np.asarray(transformed, dtype=np.float32)
+
+    @staticmethod
     def qv_mult(q: np.ndarray, v: np.ndarray) -> np.ndarray:
         q = np.array(q, dtype=np.float64)
         v = np.array(v, dtype=np.float64)
@@ -434,6 +637,17 @@ class Detect3DNode(LifecycleNode):
         uv = np.cross(qvec, v)
         uuv = np.cross(qvec, uv)
         return v + 2 * (uv * q[0] + uuv)
+
+    @staticmethod
+    def create_pointcloud_msg(
+        points: np.ndarray, stamp, frame_id: str
+    ) -> PointCloud2:
+
+        header = Header()
+        header.stamp = stamp
+        header.frame_id = frame_id
+
+        return point_cloud2.create_cloud_xyz32(header, points.tolist())
 
 
 def main():
