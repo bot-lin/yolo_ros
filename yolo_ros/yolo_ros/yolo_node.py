@@ -36,7 +36,6 @@ from ultralytics.engine.results import Keypoints
 
 from std_srvs.srv import SetBool
 from sensor_msgs.msg import Image
-from std_msgs.msg import Header
 from yolo_msgs.msg import Point2D
 from yolo_msgs.msg import BoundingBox2D
 from yolo_msgs.msg import Mask
@@ -58,9 +57,6 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("device", "cuda:0")
         self.declare_parameter("yolo_encoding", "bgr8")
         self.declare_parameter("enable", True)
-        self.declare_parameter("use_stream_source", False)
-        self.declare_parameter("stream_source", "")
-        self.declare_parameter("stream_frame_id", "camera_link")
         self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
 
         self.declare_parameter("threshold", 0.5)
@@ -117,15 +113,6 @@ class YoloNode(LifecycleNode):
 
         # ros params
         self.enable = self.get_parameter("enable").get_parameter_value().bool_value
-        self.use_stream_source = (
-            self.get_parameter("use_stream_source").get_parameter_value().bool_value
-        )
-        self.stream_source = (
-            self.get_parameter("stream_source").get_parameter_value().string_value
-        )
-        self.stream_frame_id = (
-            self.get_parameter("stream_frame_id").get_parameter_value().string_value
-        )
         self.reliability = (
             self.get_parameter("image_reliability").get_parameter_value().integer_value
         )
@@ -168,27 +155,9 @@ class YoloNode(LifecycleNode):
                 SetClasses, "set_classes", self.set_classes_cb
             )
 
-        self._sub = None
-        self._stream_timer = None
-        self._stream_generator = None
-
-        if self.use_stream_source:
-            if not self.stream_source:
-                self.get_logger().error(
-                    "Parameter 'stream_source' is empty while use_stream_source is True"
-                )
-                return TransitionCallbackReturn.ERROR
-
-            self._stream_generator = self.yolo(self.stream_source, stream=True)
-            self._stream_timer = self.create_timer(0.001, self.stream_cb)
-            self.get_logger().info(
-                f"Using direct stream source for inference: {self.stream_source}"
-            )
-        else:
-            self._sub = self.create_subscription(
-                Image, "image_raw", self.image_cb, self.image_qos_profile
-            )
-            self.get_logger().info("Subscribed to ROS image topic: image_raw")
+        self._sub = self.create_subscription(
+            Image, "image_raw", self.image_cb, self.image_qos_profile
+        )
 
         super().on_activate(state)
         self.get_logger().info(f"[{self.get_name()}] Activated")
@@ -210,14 +179,8 @@ class YoloNode(LifecycleNode):
             self.destroy_service(self._set_classes_srv)
             self._set_classes_srv = None
 
-        if self._sub is not None:
-            self.destroy_subscription(self._sub)
-            self._sub = None
-
-        if self._stream_timer is not None:
-            self.destroy_timer(self._stream_timer)
-            self._stream_timer = None
-            self._stream_generator = None
+        self.destroy_subscription(self._sub)
+        self._sub = None
 
         super().on_deactivate(state)
         self.get_logger().info(f"[{self.get_name()}] Deactivated")
@@ -367,132 +330,118 @@ class YoloNode(LifecycleNode):
 
         return keypoints_list
 
-    def stream_cb(self) -> None:
-        if not self.enable:
-            return
-
-        if self._stream_generator is None:
-            return
-
-        try:
-            results: Results = next(self._stream_generator).cpu()
-        except StopIteration:
-            self.get_logger().warning("Stream ended, trying to reconnect stream source")
-            self._stream_generator = self.yolo(self.stream_source, stream=True)
-            return
-        except Exception as exc:
-            self.get_logger().warning(f"Direct stream read failed: {exc}")
-            return
-
-        header = Header()
-        header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = self.stream_frame_id
-
-        self.publish_results(results, header)
-
     def image_cb(self, msg: Image) -> None:
-        if not self.enable:
-            return
 
-        cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding=self.yolo_encoding)
-        results: Results = self.yolo(cv_image)[0].cpu()
-        self.publish_results(results, msg.header)
+        if self.enable:
 
-        del results
-        del cv_image
+            # convert image + predict
+            cv_image = self.cv_bridge.imgmsg_to_cv2(
+                msg, desired_encoding=self.yolo_encoding
+            )
+            
+            results = self.yolo(
+                cv_image
+            )
+            results: Results = results[0].cpu()
 
-    def publish_results(self, results: Results, header: Header) -> None:
-        hypothesis = []
-        boxes = []
-        masks = []
-        keypoints = []
-        filtered_indices = None
-
-        # Early exit if no wanted classes detected
-        if self.wanted_classes and len(self.wanted_classes) > 0:
-            if results.boxes or results.obb:
-
-                # Check if any detection matches wanted classes
-                has_wanted_class = False
-                for box_data in (results.boxes if results.boxes else []):
-                    if int(box_data.cls) in self.wanted_classes:
-                        has_wanted_class = True
-                        break
-
-                # Early exit if no wanted classes found
-                if not has_wanted_class:
-                    detections_msg = DetectionArray()
-                    detections_msg.header = header
-                    self._pub.publish(detections_msg)
-                    return
-            else:
-                # No boxes/obb detected, publish empty and return
-                detections_msg = DetectionArray()
-                detections_msg.header = header
-                self._pub.publish(detections_msg)
-                return
-
-        if results.boxes or results.obb:
-            hypothesis = self.parse_hypothesis(results)
-            boxes = self.parse_boxes(results)
-
-            # Filter detections by wanted classes
+            # Early exit if no wanted classes detected
             if self.wanted_classes and len(self.wanted_classes) > 0:
-                filtered_indices = []
-                for i, hyp in enumerate(hypothesis):
-                    if (
-                        hyp["class_id"] in self.wanted_classes
-                        and hyp["score"] >= self.confidence
-                    ):
-                        filtered_indices.append(i)
+                if results.boxes or results.obb:
+                    
+                    # Check if any detection matches wanted classes
+                    has_wanted_class = False
+                    for box_data in (results.boxes if results.boxes else []):
+                        if int(box_data.cls) in self.wanted_classes:
+                            has_wanted_class = True
+                            break
 
-                hypothesis = [hypothesis[i] for i in filtered_indices]
-                boxes = [boxes[i] for i in filtered_indices]
+                    # if results.obb and not has_wanted_class:
+                    #     for i in range(results.obb.cls.shape[0]):
+                    #         if int(results.obb.cls[i]) in self.wanted_classes:
+                    #             has_wanted_class = True
+                    #             break
 
-        if results.masks:
-            masks = self.parse_masks(results)
-            # Filter masks by wanted classes if filtering was applied
-            if filtered_indices is not None:
-                masks = [masks[i] for i in filtered_indices if i < len(masks)]
+                    # Early exit if no wanted classes found
+                    if not has_wanted_class:
+                        # Publish empty detection array
+                        detections_msg = DetectionArray()
+                        detections_msg.header = msg.header
+                        self._pub.publish(detections_msg)
+                        del results
+                        del cv_image
+                        return
+                else:
+                    # No boxes/obb detected, publish empty and return
+                    detections_msg = DetectionArray()
+                    detections_msg.header = msg.header
+                    self._pub.publish(detections_msg)
+                    del results
+                    del cv_image
+                    return
 
-        if results.keypoints:
-            keypoints = self.parse_keypoints(results)
-            # Filter keypoints by wanted classes if filtering was applied
-            if filtered_indices is not None:
-                keypoints = [keypoints[i] for i in filtered_indices if i < len(keypoints)]
+            if results.boxes or results.obb:
+                hypothesis = self.parse_hypothesis(results)
+                boxes = self.parse_boxes(results)
+                
+                # Filter detections by wanted classes
+                if self.wanted_classes and len(self.wanted_classes) > 0:
+                    filtered_indices = []
+                    for i, hyp in enumerate(hypothesis):
+                        if hyp["class_id"] in self.wanted_classes and hyp['score'] >= self.confidence:
+                            filtered_indices.append(i)
+                    
+                    hypothesis = [hypothesis[i] for i in filtered_indices]
+                    boxes = [boxes[i] for i in filtered_indices]
 
-        # create detection msgs
-        detections_msg = DetectionArray()
+            if results.masks:
+                masks = self.parse_masks(results)
+                # Filter masks by wanted classes if filtering was applied
+                if self.wanted_classes and len(self.wanted_classes) > 0 and 'filtered_indices' in locals():
+                    masks = [masks[i] for i in filtered_indices]
 
-        # Determine the number of detections to process
-        num_detections = 0
-        if (results.boxes or results.obb) and hypothesis and boxes:
-            num_detections = len(hypothesis)
-        elif results.masks and masks:
-            num_detections = len(masks)
-        elif results.keypoints and keypoints:
-            num_detections = len(keypoints)
+            if results.keypoints:
+                keypoints = self.parse_keypoints(results)
+                # Filter keypoints by wanted classes if filtering was applied
+                if self.wanted_classes and len(self.wanted_classes) > 0 and 'filtered_indices' in locals():
+                    keypoints = [keypoints[i] for i in filtered_indices]
 
-        for i in range(num_detections):
-            aux_msg = Detection()
+            # create detection msgs
+            detections_msg = DetectionArray()
+            
+            # Determine the number of detections to process
+            num_detections = 0
+            if results.boxes or results.obb and hypothesis and boxes:
+                num_detections = len(hypothesis)
+            elif results.masks and masks:
+                num_detections = len(masks)
+            elif results.keypoints and keypoints:
+                num_detections = len(keypoints)
 
-            if (results.boxes or results.obb) and hypothesis and boxes:
-                aux_msg.class_id = hypothesis[i]["class_id"]
-                aux_msg.class_name = hypothesis[i]["class_name"]
-                aux_msg.score = hypothesis[i]["score"]
-                aux_msg.bbox = boxes[i]
+            for i in range(num_detections):
 
-            if results.masks and masks and i < len(masks):
-                aux_msg.mask = masks[i]
+                aux_msg = Detection()
 
-            if results.keypoints and keypoints and i < len(keypoints):
-                aux_msg.keypoints = keypoints[i]
+                if results.boxes or results.obb and hypothesis and boxes:
+                    aux_msg.class_id = hypothesis[i]["class_id"]
+                    aux_msg.class_name = hypothesis[i]["class_name"]
+                    aux_msg.score = hypothesis[i]["score"]
 
-            detections_msg.detections.append(aux_msg)
+                    aux_msg.bbox = boxes[i]
 
-        # publish detections
-        detections_msg.header = header
-        self._pub.publish(detections_msg)
+                if results.masks and masks:
+                    aux_msg.mask = masks[i]
+
+                if results.keypoints and keypoints:
+                    aux_msg.keypoints = keypoints[i]
+
+                detections_msg.detections.append(aux_msg)
+
+            # publish detections
+            detections_msg.header = msg.header
+            self._pub.publish(detections_msg)
+
+            del results
+            del cv_image
 
     def set_classes_cb(
         self,

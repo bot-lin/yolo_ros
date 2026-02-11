@@ -71,27 +71,6 @@ def generate_launch_description():
             description="Whether to start YOLO enabled",
         )
 
-        use_stream_source = LaunchConfiguration("use_stream_source")
-        use_stream_source_cmd = DeclareLaunchArgument(
-            "use_stream_source",
-            default_value="False",
-            description="Whether yolo_node runs inference directly from an URL stream source",
-        )
-
-        stream_source = LaunchConfiguration("stream_source")
-        stream_source_cmd = DeclareLaunchArgument(
-            "stream_source",
-            default_value="",
-            description="Direct stream URL for yolo_node (e.g. rtsp/http mjpeg)",
-        )
-
-        stream_frame_id = LaunchConfiguration("stream_frame_id")
-        stream_frame_id_cmd = DeclareLaunchArgument(
-            "stream_frame_id",
-            default_value="camera_link",
-            description="Frame ID used in detections header when direct stream mode is enabled",
-        )
-
         threshold = LaunchConfiguration("threshold")
         threshold_cmd = DeclareLaunchArgument(
             "threshold",
@@ -273,9 +252,6 @@ def generate_launch_description():
                     "device": device,
                     "yolo_encoding": yolo_encoding,
                     "enable": enable,
-                    "use_stream_source": use_stream_source,
-                    "stream_source": stream_source,
-                    "stream_frame_id": stream_frame_id,
                     "threshold": threshold,
                     "iou": iou,
                     "imgsz_height": imgsz_height,
@@ -345,9 +321,6 @@ def generate_launch_description():
             device_cmd,
             yolo_encoding_cmd,
             enable_cmd,
-            use_stream_source_cmd,
-            stream_source_cmd,
-            stream_frame_id_cmd,
             threshold_cmd,
             iou_cmd,
             imgsz_height_cmd,
