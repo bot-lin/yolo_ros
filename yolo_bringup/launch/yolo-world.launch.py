@@ -44,6 +44,15 @@ def generate_launch_description():
                     "input_image_topic": LaunchConfiguration(
                         "input_image_topic", default="/camera/rgb/image_raw"
                     ),
+                    "image_is_compressed": LaunchConfiguration(
+                        "image_is_compressed", default="False"
+                    ),
+                    "compressed_decode_backend": LaunchConfiguration(
+                        "compressed_decode_backend", default="auto"
+                    ),
+                    "mpp_decode_timeout_ms": LaunchConfiguration(
+                        "mpp_decode_timeout_ms", default="40"
+                    ),
                     "image_reliability": LaunchConfiguration(
                         "image_reliability", default="1"
                     ),

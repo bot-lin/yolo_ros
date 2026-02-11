@@ -143,6 +143,9 @@ These are the parameters from the [yolo.launch.py](./yolo_bringup/launch/yolo.la
 - **tracker**: tracker file (default: bytetrack.yaml)
 - **device**: GPU/CUDA (default: cuda:0)
 - **yolo_encoding**: Encoding to convert input image before using YOLO (default: bgr8)
+- **image_is_compressed**: subscribe to `sensor_msgs/CompressedImage` instead of `sensor_msgs/Image` (default: False)
+- **compressed_decode_backend**: compressed decode backend. `auto` tries RK3588 VPU (`mppjpegdec`) first, then CPU fallback. `cpu` forces OpenCV decode. `vpu_mpp` forces VPU decode with CPU fallback if unavailable (default: auto)
+- **mpp_decode_timeout_ms**: timeout (ms) waiting for a decoded frame from `mppjpegdec` (default: 40)
 - **enable**: whether to start YOLO enabled (default: True)
 - **threshold**: detection threshold (default: 0.5)
 - **iou**: intersection Over Union (IoU) threshold for Non-Maximum Suppression (NMS) (default: 0.7)
@@ -165,6 +168,15 @@ These are the parameters from the [yolo.launch.py](./yolo_bringup/launch/yolo.la
 - **use_tracking**: whether to activate tracking after detection (default: True)
 - **use_3d**: whether to activate 3D detections (default: False)
 - **use_debug**: whether to activate debug node (default: True)
+
+Example for JPEG compressed topic on RK3588:
+
+```shell
+ros2 launch yolo_bringup yolo.launch.py \
+  input_image_topic:=/camera/image_raw/compressed \
+  image_is_compressed:=True \
+  compressed_decode_backend:=auto
+```
 
 ## Lifecycle Nodes
 

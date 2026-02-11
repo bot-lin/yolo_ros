@@ -64,6 +64,32 @@ def generate_launch_description():
             description="Encoding of the input image topic",
         )
 
+        image_is_compressed = LaunchConfiguration("image_is_compressed")
+        image_is_compressed_cmd = DeclareLaunchArgument(
+            "image_is_compressed",
+            default_value="False",
+            choices=["True", "False"],
+            description="Whether input_image_topic publishes sensor_msgs/CompressedImage",
+        )
+
+        compressed_decode_backend = LaunchConfiguration("compressed_decode_backend")
+        compressed_decode_backend_cmd = DeclareLaunchArgument(
+            "compressed_decode_backend",
+            default_value="auto",
+            choices=["auto", "cpu", "vpu_mpp"],
+            description=(
+                "Compressed image decoder backend: auto (try RK3588 VPU), "
+                "cpu (OpenCV), vpu_mpp (force mppjpegdec)"
+            ),
+        )
+
+        mpp_decode_timeout_ms = LaunchConfiguration("mpp_decode_timeout_ms")
+        mpp_decode_timeout_ms_cmd = DeclareLaunchArgument(
+            "mpp_decode_timeout_ms",
+            default_value="40",
+            description="Timeout in milliseconds when waiting for mppjpegdec output",
+        )
+
         enable = LaunchConfiguration("enable")
         enable_cmd = DeclareLaunchArgument(
             "enable",
@@ -251,6 +277,9 @@ def generate_launch_description():
                     "model": model,
                     "device": device,
                     "yolo_encoding": yolo_encoding,
+                    "image_is_compressed": image_is_compressed,
+                    "compressed_decode_backend": compressed_decode_backend,
+                    "mpp_decode_timeout_ms": mpp_decode_timeout_ms,
                     "enable": enable,
                     "threshold": threshold,
                     "iou": iou,
@@ -320,6 +349,9 @@ def generate_launch_description():
             tracker_cmd,
             device_cmd,
             yolo_encoding_cmd,
+            image_is_compressed_cmd,
+            compressed_decode_backend_cmd,
+            mpp_decode_timeout_ms_cmd,
             enable_cmd,
             threshold_cmd,
             iou_cmd,

@@ -15,7 +15,9 @@
 
 
 import cv2
-from typing import List, Dict
+import numpy as np
+import threading
+from typing import List, Dict, Optional
 from cv_bridge import CvBridge
 
 import rclpy
@@ -36,6 +38,7 @@ from ultralytics.engine.results import Keypoints
 
 from std_srvs.srv import SetBool
 from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage
 from yolo_msgs.msg import Point2D
 from yolo_msgs.msg import BoundingBox2D
 from yolo_msgs.msg import Mask
@@ -44,6 +47,83 @@ from yolo_msgs.msg import KeyPoint2DArray
 from yolo_msgs.msg import Detection
 from yolo_msgs.msg import DetectionArray
 from yolo_msgs.srv import SetClasses
+
+try:
+    import gi
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    GST_AVAILABLE = True
+except (ImportError, ValueError):
+    Gst = None
+    GST_AVAILABLE = False
+
+
+class RockchipMppJpegDecoder:
+    def __init__(self, timeout_ms: int = 40) -> None:
+        if not GST_AVAILABLE:
+            raise RuntimeError("python3-gi / GStreamer bindings are not available")
+
+        Gst.init(None)
+
+        pipeline_description = (
+            "appsrc name=src is-live=true block=true format=time do-timestamp=true "
+            "! image/jpeg "
+            "! jpegparse "
+            "! mppjpegdec "
+            "! videoconvert "
+            "! video/x-raw,format=BGR "
+            "! appsink name=sink sync=false max-buffers=1 drop=true"
+        )
+
+        self.pipeline = Gst.parse_launch(pipeline_description)
+        self.src = self.pipeline.get_by_name("src")
+        self.sink = self.pipeline.get_by_name("sink")
+
+        if self.src is None or self.sink is None:
+            raise RuntimeError("failed to initialize mppjpegdec pipeline")
+
+        self.src.set_property("caps", Gst.Caps.from_string("image/jpeg"))
+        self.timeout_ns = int(timeout_ms * 1e6)
+
+        state_change = self.pipeline.set_state(Gst.State.PLAYING)
+        if state_change == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("failed to set mppjpegdec pipeline to PLAYING state")
+
+    def decode(self, jpeg_data: bytes) -> Optional[np.ndarray]:
+        gst_buffer = Gst.Buffer.new_allocate(None, len(jpeg_data), None)
+        gst_buffer.fill(0, jpeg_data)
+
+        flow_ret = self.src.emit("push-buffer", gst_buffer)
+        if flow_ret != Gst.FlowReturn.OK:
+            raise RuntimeError(f"push-buffer failed: {flow_ret}")
+
+        sample = self.sink.emit("try-pull-sample", self.timeout_ns)
+        if sample is None:
+            return None
+
+        caps = sample.get_caps()
+        structure = caps.get_structure(0)
+        width = int(structure.get_value("width"))
+        height = int(structure.get_value("height"))
+
+        buffer = sample.get_buffer()
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+        if not success:
+            return None
+
+        try:
+            image = np.frombuffer(map_info.data, dtype=np.uint8)
+            image = image.reshape((height, width, 3)).copy()
+        finally:
+            buffer.unmap(map_info)
+
+        return image
+
+    def close(self) -> None:
+        if hasattr(self, "pipeline") and self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
 
 
 class YoloNode(LifecycleNode):
@@ -58,6 +138,9 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("yolo_encoding", "bgr8")
         self.declare_parameter("enable", True)
         self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
+        self.declare_parameter("image_is_compressed", False)
+        self.declare_parameter("compressed_decode_backend", "auto")
+        self.declare_parameter("mpp_decode_timeout_ms", 40)
 
         self.declare_parameter("threshold", 0.5)
         self.declare_parameter("confidence", 0.5)  # legacy
@@ -73,6 +156,9 @@ class YoloNode(LifecycleNode):
 
 
         self.type_to_model = {"YOLO": YOLO, "World": YOLOWorld, "YOLOE": YOLOE}
+        self._compressed_cb_lock = threading.Lock()
+        self._compressed_drop_counter = 0
+        self._no_client_skip_counter = 0
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Configuring...")
@@ -116,6 +202,22 @@ class YoloNode(LifecycleNode):
         self.reliability = (
             self.get_parameter("image_reliability").get_parameter_value().integer_value
         )
+        self.image_is_compressed = (
+            self.get_parameter("image_is_compressed").get_parameter_value().bool_value
+        )
+        self.compressed_decode_backend = (
+            self.get_parameter("compressed_decode_backend")
+            .get_parameter_value()
+            .string_value
+            .lower()
+        )
+        self.mpp_decode_timeout_ms = (
+            self.get_parameter("mpp_decode_timeout_ms")
+            .get_parameter_value()
+            .integer_value
+        )
+        self._mpp_decoder: Optional[RockchipMppJpegDecoder] = None
+        self._warned_unsupported_compressed_encoding = False
 
         self.wanted_classes = (
             self.get_parameter("wanted_classes").get_parameter_value().integer_array_value
@@ -155,9 +257,18 @@ class YoloNode(LifecycleNode):
                 SetClasses, "set_classes", self.set_classes_cb
             )
 
-        self._sub = self.create_subscription(
-            Image, "image_raw", self.image_cb, self.image_qos_profile
-        )
+        if self.image_is_compressed:
+            self._setup_compressed_decoder()
+            self._sub = self.create_subscription(
+                CompressedImage,
+                "image_raw",
+                self.compressed_image_cb,
+                self.image_qos_profile,
+            )
+        else:
+            self._sub = self.create_subscription(
+                Image, "image_raw", self.image_cb, self.image_qos_profile
+            )
 
         super().on_activate(state)
         self.get_logger().info(f"[{self.get_name()}] Activated")
@@ -167,6 +278,8 @@ class YoloNode(LifecycleNode):
     def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Deactivating...")
 
+        is_world_model = isinstance(self.yolo, YOLOWorld)
+
         del self.yolo
         if "cuda" in self.device:
             self.get_logger().info("Clearing CUDA cache")
@@ -175,12 +288,16 @@ class YoloNode(LifecycleNode):
         self.destroy_service(self._enable_srv)
         self._enable_srv = None
 
-        if isinstance(self.yolo, YOLOWorld):
+        if is_world_model:
             self.destroy_service(self._set_classes_srv)
             self._set_classes_srv = None
 
         self.destroy_subscription(self._sub)
         self._sub = None
+
+        if self._mpp_decoder is not None:
+            self._mpp_decoder.close()
+            self._mpp_decoder = None
 
         super().on_deactivate(state)
         self.get_logger().info(f"[{self.get_name()}] Deactivated")
@@ -213,6 +330,83 @@ class YoloNode(LifecycleNode):
         self.enable = request.data
         response.success = True
         return response
+
+    def _setup_compressed_decoder(self) -> None:
+        if self.compressed_decode_backend not in {"auto", "cpu", "vpu_mpp"}:
+            self.get_logger().warn(
+                "Invalid compressed_decode_backend. Valid values: auto, cpu, vpu_mpp. Falling back to auto."
+            )
+            self.compressed_decode_backend = "auto"
+
+        if self.compressed_decode_backend in {"auto", "vpu_mpp"}:
+            try:
+                self._mpp_decoder = RockchipMppJpegDecoder(self.mpp_decode_timeout_ms)
+                self.get_logger().info(
+                    "Using RK3588 VPU JPEG decoder backend: mppjpegdec"
+                )
+                return
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"Unable to initialize VPU JPEG decoder ({exc}). Falling back to CPU decoder."
+                )
+
+        self._mpp_decoder = None
+        self.get_logger().info("Using CPU JPEG decoder backend: cv2.imdecode")
+
+    def _decode_compressed_image(self, msg: CompressedImage) -> Optional[np.ndarray]:
+        image = None
+        jpeg_data = bytes(msg.data)
+
+        if self._mpp_decoder is not None:
+            try:
+                image = self._mpp_decoder.decode(jpeg_data)
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"VPU JPEG decode failed ({exc}). Switching to CPU decoder."
+                )
+                self._mpp_decoder.close()
+                self._mpp_decoder = None
+
+        if image is None:
+            np_data = np.frombuffer(jpeg_data, dtype=np.uint8)
+            image = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
+
+        if image is None:
+            self.get_logger().warn("Failed to decode compressed image")
+            return None
+
+        if self.yolo_encoding == "bgr8":
+            return image
+        if self.yolo_encoding == "rgb8":
+            return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if self.yolo_encoding == "mono8":
+            return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        # Fall back to cv_bridge if a custom encoding is requested.
+        if not self._warned_unsupported_compressed_encoding:
+            self.get_logger().warn(
+                f"Compressed decoding currently supports bgr8/rgb8/mono8 only. "
+                f"Falling back to cv_bridge for encoding '{self.yolo_encoding}'."
+            )
+            self._warned_unsupported_compressed_encoding = True
+        return self.cv_bridge.compressed_imgmsg_to_cv2(
+            msg, desired_encoding=self.yolo_encoding
+        )
+
+    def _has_result_clients(self) -> bool:
+        return self._pub.get_subscription_count() > 0
+
+    def _skip_if_no_clients(self) -> bool:
+        if self._has_result_clients():
+            self._no_client_skip_counter = 0
+            return False
+
+        self._no_client_skip_counter += 1
+        if self._no_client_skip_counter % 120 == 0:
+            self.get_logger().info(
+                "No subscribers on 'detections'; skipping image processing"
+            )
+        return True
 
     def parse_hypothesis(self, results: Results) -> List[Dict]:
 
@@ -331,117 +525,138 @@ class YoloNode(LifecycleNode):
         return keypoints_list
 
     def image_cb(self, msg: Image) -> None:
+        if not self.enable:
+            return
+        if self._skip_if_no_clients():
+            return
 
-        if self.enable:
+        cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding=self.yolo_encoding)
+        self.process_image(cv_image, msg.header)
 
-            # convert image + predict
-            cv_image = self.cv_bridge.imgmsg_to_cv2(
-                msg, desired_encoding=self.yolo_encoding
-            )
-            
-            results = self.yolo(
-                cv_image
-            )
-            results: Results = results[0].cpu()
+    def compressed_image_cb(self, msg: CompressedImage) -> None:
+        if not self.enable:
+            return
+        if self._skip_if_no_clients():
+            return
 
-            # Early exit if no wanted classes detected
-            if self.wanted_classes and len(self.wanted_classes) > 0:
-                if results.boxes or results.obb:
-                    
-                    # Check if any detection matches wanted classes
-                    has_wanted_class = False
-                    for box_data in (results.boxes if results.boxes else []):
-                        if int(box_data.cls) in self.wanted_classes:
-                            has_wanted_class = True
-                            break
+        # Drop incoming compressed frames while the previous one is still running.
+        if not self._compressed_cb_lock.acquire(blocking=False):
+            self._compressed_drop_counter += 1
+            if self._compressed_drop_counter % 60 == 0:
+                self.get_logger().warn(
+                    "Dropping compressed frame because previous callback is still processing"
+                )
+            return
 
-                    # if results.obb and not has_wanted_class:
-                    #     for i in range(results.obb.cls.shape[0]):
-                    #         if int(results.obb.cls[i]) in self.wanted_classes:
-                    #             has_wanted_class = True
-                    #             break
+        try:
+            cv_image = self._decode_compressed_image(msg)
+            if cv_image is None:
+                return
 
-                    # Early exit if no wanted classes found
-                    if not has_wanted_class:
-                        # Publish empty detection array
-                        detections_msg = DetectionArray()
-                        detections_msg.header = msg.header
-                        self._pub.publish(detections_msg)
-                        del results
-                        del cv_image
-                        return
-                else:
-                    # No boxes/obb detected, publish empty and return
+            self.process_image(cv_image, msg.header)
+        finally:
+            self._compressed_cb_lock.release()
+
+    def process_image(self, cv_image, header) -> None:
+        results = self.yolo(cv_image)
+        results: Results = results[0].cpu()
+
+        filtered_indices = None
+        hypothesis = []
+        boxes = []
+        masks = []
+        keypoints = []
+
+        # Early exit if no wanted classes detected
+        if self.wanted_classes and len(self.wanted_classes) > 0:
+            if results.boxes or results.obb:
+
+                has_wanted_class = False
+                for box_data in (results.boxes if results.boxes else []):
+                    if int(box_data.cls) in self.wanted_classes:
+                        has_wanted_class = True
+                        break
+
+                if not has_wanted_class:
                     detections_msg = DetectionArray()
-                    detections_msg.header = msg.header
+                    detections_msg.header = header
                     self._pub.publish(detections_msg)
                     del results
-                    del cv_image
                     return
+            else:
+                detections_msg = DetectionArray()
+                detections_msg.header = header
+                self._pub.publish(detections_msg)
+                del results
+                return
 
-            if results.boxes or results.obb:
-                hypothesis = self.parse_hypothesis(results)
-                boxes = self.parse_boxes(results)
-                
-                # Filter detections by wanted classes
-                if self.wanted_classes and len(self.wanted_classes) > 0:
-                    filtered_indices = []
-                    for i, hyp in enumerate(hypothesis):
-                        if hyp["class_id"] in self.wanted_classes and hyp['score'] >= self.confidence:
-                            filtered_indices.append(i)
-                    
-                    hypothesis = [hypothesis[i] for i in filtered_indices]
-                    boxes = [boxes[i] for i in filtered_indices]
+        if results.boxes or results.obb:
+            hypothesis = self.parse_hypothesis(results)
+            boxes = self.parse_boxes(results)
 
-            if results.masks:
-                masks = self.parse_masks(results)
-                # Filter masks by wanted classes if filtering was applied
-                if self.wanted_classes and len(self.wanted_classes) > 0 and 'filtered_indices' in locals():
-                    masks = [masks[i] for i in filtered_indices]
+            # Filter detections by wanted classes
+            if self.wanted_classes and len(self.wanted_classes) > 0:
+                filtered_indices = []
+                for i, hyp in enumerate(hypothesis):
+                    if (
+                        hyp["class_id"] in self.wanted_classes
+                        and hyp["score"] >= self.confidence
+                    ):
+                        filtered_indices.append(i)
 
-            if results.keypoints:
-                keypoints = self.parse_keypoints(results)
-                # Filter keypoints by wanted classes if filtering was applied
-                if self.wanted_classes and len(self.wanted_classes) > 0 and 'filtered_indices' in locals():
-                    keypoints = [keypoints[i] for i in filtered_indices]
+                hypothesis = [hypothesis[i] for i in filtered_indices]
+                boxes = [boxes[i] for i in filtered_indices]
 
-            # create detection msgs
-            detections_msg = DetectionArray()
-            
-            # Determine the number of detections to process
-            num_detections = 0
-            if results.boxes or results.obb and hypothesis and boxes:
-                num_detections = len(hypothesis)
-            elif results.masks and masks:
-                num_detections = len(masks)
-            elif results.keypoints and keypoints:
-                num_detections = len(keypoints)
+        if results.masks:
+            masks = self.parse_masks(results)
+            if (
+                self.wanted_classes
+                and len(self.wanted_classes) > 0
+                and filtered_indices is not None
+            ):
+                masks = [masks[i] for i in filtered_indices]
 
-            for i in range(num_detections):
+        if results.keypoints:
+            keypoints = self.parse_keypoints(results)
+            if (
+                self.wanted_classes
+                and len(self.wanted_classes) > 0
+                and filtered_indices is not None
+            ):
+                keypoints = [keypoints[i] for i in filtered_indices]
 
-                aux_msg = Detection()
+        # create detection msgs
+        detections_msg = DetectionArray()
 
-                if results.boxes or results.obb and hypothesis and boxes:
-                    aux_msg.class_id = hypothesis[i]["class_id"]
-                    aux_msg.class_name = hypothesis[i]["class_name"]
-                    aux_msg.score = hypothesis[i]["score"]
+        num_detections = 0
+        if (results.boxes or results.obb) and hypothesis and boxes:
+            num_detections = len(hypothesis)
+        elif results.masks and masks:
+            num_detections = len(masks)
+        elif results.keypoints and keypoints:
+            num_detections = len(keypoints)
 
-                    aux_msg.bbox = boxes[i]
+        for i in range(num_detections):
+            aux_msg = Detection()
 
-                if results.masks and masks:
-                    aux_msg.mask = masks[i]
+            if (results.boxes or results.obb) and hypothesis and boxes:
+                aux_msg.class_id = hypothesis[i]["class_id"]
+                aux_msg.class_name = hypothesis[i]["class_name"]
+                aux_msg.score = hypothesis[i]["score"]
+                aux_msg.bbox = boxes[i]
 
-                if results.keypoints and keypoints:
-                    aux_msg.keypoints = keypoints[i]
+            if results.masks and masks:
+                aux_msg.mask = masks[i]
 
-                detections_msg.detections.append(aux_msg)
+            if results.keypoints and keypoints:
+                aux_msg.keypoints = keypoints[i]
 
-            # publish detections
-            detections_msg.header = msg.header
-            self._pub.publish(detections_msg)
+            detections_msg.detections.append(aux_msg)
 
-            del results
-            del cv_image
+        detections_msg.header = header
+        self._pub.publish(detections_msg)
+
+        del results
 
     def set_classes_cb(
         self,
