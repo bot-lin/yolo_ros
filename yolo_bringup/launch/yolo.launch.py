@@ -254,6 +254,34 @@ def generate_launch_description():
             description="Whether to activate the debug node",
         )
 
+        use_mjpeg_output = LaunchConfiguration("use_mjpeg_output")
+        use_mjpeg_output_cmd = DeclareLaunchArgument(
+            "use_mjpeg_output",
+            default_value="False",
+            description="Whether to stream debug image via MJPEG HTTP",
+        )
+
+        mjpeg_output_port = LaunchConfiguration("mjpeg_output_port")
+        mjpeg_output_port_cmd = DeclareLaunchArgument(
+            "mjpeg_output_port",
+            default_value="8083",
+            description="HTTP port for the MJPEG output stream of debug image",
+        )
+
+        mjpeg_output_quality = LaunchConfiguration("mjpeg_output_quality")
+        mjpeg_output_quality_cmd = DeclareLaunchArgument(
+            "mjpeg_output_quality",
+            default_value="80",
+            description="JPEG quality for MJPEG output stream [1-100]",
+        )
+
+        mjpeg_output_rate = LaunchConfiguration("mjpeg_output_rate")
+        mjpeg_output_rate_cmd = DeclareLaunchArgument(
+            "mjpeg_output_rate",
+            default_value="10.0",
+            description="Maximum output rate in Hz for MJPEG stream",
+        )
+
         # get topics for remap
         detect_3d_detections_topic = "detections"
         debug_detections_topic = "detections"
@@ -343,6 +371,25 @@ def generate_launch_description():
             condition=IfCondition(PythonExpression([use_debug])),
         )
 
+        mjpeg_output_node_cmd = Node(
+            package="yolo_ros",
+            executable="mjpeg_output_node",
+            name="mjpeg_output_node",
+            namespace=namespace,
+            parameters=[
+                {
+                    "input_topic": "dbg_image",
+                    "port": mjpeg_output_port,
+                    "jpeg_quality": mjpeg_output_quality,
+                    "max_rate_hz": mjpeg_output_rate,
+                    "image_reliability": image_reliability,
+                }
+            ],
+            condition=IfCondition(
+                PythonExpression([use_debug, " and ", use_mjpeg_output])
+            ),
+        )
+
         return (
             model_type_cmd,
             model_cmd,
@@ -375,10 +422,15 @@ def generate_launch_description():
             maximum_detection_threshold_cmd,
             namespace_cmd,
             use_debug_cmd,
+            use_mjpeg_output_cmd,
+            mjpeg_output_port_cmd,
+            mjpeg_output_quality_cmd,
+            mjpeg_output_rate_cmd,
             yolo_node_cmd,
             tracking_node_cmd,
             detect_3d_node_cmd,
             debug_node_cmd,
+            mjpeg_output_node_cmd,
         )
 
     use_tracking = LaunchConfiguration("use_tracking")
