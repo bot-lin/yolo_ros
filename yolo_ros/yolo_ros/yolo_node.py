@@ -138,6 +138,7 @@ class YoloNode(LifecycleNode):
         self.declare_parameter("device", "cuda:0")
         self.declare_parameter("yolo_encoding", "bgr8")
         self.declare_parameter("enable", True)
+        self.declare_parameter("max_process_rate_hz", 0.0)
         self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
         self.declare_parameter("image_is_compressed", False)
         self.declare_parameter("compressed_decode_backend", "auto")
@@ -160,6 +161,7 @@ class YoloNode(LifecycleNode):
         self._compressed_cb_lock = threading.Lock()
         self._compressed_drop_counter = 0
         self._no_client_skip_counter = 0
+        self._rate_limit_skip_counter = 0
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Configuring...")
@@ -200,6 +202,9 @@ class YoloNode(LifecycleNode):
 
         # ros params
         self.enable = self.get_parameter("enable").get_parameter_value().bool_value
+        self.max_process_rate_hz = (
+            self.get_parameter("max_process_rate_hz").get_parameter_value().double_value
+        )
         self.reliability = (
             self.get_parameter("image_reliability").get_parameter_value().integer_value
         )
@@ -219,6 +224,13 @@ class YoloNode(LifecycleNode):
         )
         self._mpp_decoder: Optional[RockchipMppJpegDecoder] = None
         self._warned_unsupported_compressed_encoding = False
+        self._last_process_time_ns: Optional[int] = None
+        if self.max_process_rate_hz > 0.0:
+            self._min_process_period_ns = max(
+                1, int(1e9 / self.max_process_rate_hz)
+            )
+        else:
+            self._min_process_period_ns = 0
 
         self.wanted_classes = (
             self.get_parameter("wanted_classes").get_parameter_value().integer_array_value
@@ -429,6 +441,34 @@ class YoloNode(LifecycleNode):
             )
         return True
 
+    def _skip_if_rate_limited(self) -> bool:
+        if self._min_process_period_ns <= 0:
+            return False
+
+        now_ns = self.get_clock().now().nanoseconds
+        if self._last_process_time_ns is None:
+            self._last_process_time_ns = now_ns
+            self._rate_limit_skip_counter = 0
+            return False
+
+        elapsed_ns = now_ns - self._last_process_time_ns
+        if elapsed_ns < 0:
+            self._last_process_time_ns = now_ns
+            self._rate_limit_skip_counter = 0
+            return False
+
+        if elapsed_ns < self._min_process_period_ns:
+            self._rate_limit_skip_counter += 1
+            if self._rate_limit_skip_counter % 120 == 0:
+                self.get_logger().info(
+                    f"Rate-limiting image processing to {self.max_process_rate_hz:.2f} Hz"
+                )
+            return True
+
+        self._last_process_time_ns = now_ns
+        self._rate_limit_skip_counter = 0
+        return False
+
     def parse_hypothesis(self, results: Results) -> List[Dict]:
 
         hypothesis_list = []
@@ -550,6 +590,8 @@ class YoloNode(LifecycleNode):
             return
         if self._skip_if_no_clients():
             return
+        if self._skip_if_rate_limited():
+            return
 
         cv_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding=self.yolo_encoding)
         self.process_image(cv_image, msg.header)
@@ -558,6 +600,8 @@ class YoloNode(LifecycleNode):
         if not self.enable:
             return
         if self._skip_if_no_clients():
+            return
+        if self._skip_if_rate_limited():
             return
 
         # Drop incoming compressed frames while the previous one is still running.

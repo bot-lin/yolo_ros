@@ -105,6 +105,16 @@ def generate_launch_description():
             description="Whether detect_3d_node follows yolo_node enable state",
         )
 
+        max_process_rate_hz = LaunchConfiguration("max_process_rate_hz")
+        max_process_rate_hz_cmd = DeclareLaunchArgument(
+            "max_process_rate_hz",
+            default_value="0.0",
+            description=(
+                "Maximum YOLO image processing rate in Hz. "
+                "Use 0.0 to disable rate limiting."
+            ),
+        )
+
         threshold = LaunchConfiguration("threshold")
         threshold_cmd = DeclareLaunchArgument(
             "threshold",
@@ -317,6 +327,7 @@ def generate_launch_description():
                     "compressed_decode_backend": compressed_decode_backend,
                     "mpp_decode_timeout_ms": mpp_decode_timeout_ms,
                     "enable": enable,
+                    "max_process_rate_hz": max_process_rate_hz,
                     "threshold": threshold,
                     "iou": iou,
                     "imgsz_height": imgsz_height,
@@ -411,6 +422,7 @@ def generate_launch_description():
             mpp_decode_timeout_ms_cmd,
             enable_cmd,
             auto_follow_yolo_enable_cmd,
+            max_process_rate_hz_cmd,
             threshold_cmd,
             iou_cmd,
             imgsz_height_cmd,

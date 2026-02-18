@@ -148,6 +148,7 @@ These are the parameters from the [yolo.launch.py](./yolo_bringup/launch/yolo.la
 - **compressed_decode_backend**: compressed decode backend. `auto` tries RK3588 VPU (`mppjpegdec`) first, then CPU fallback. `cpu` forces OpenCV decode. `vpu_mpp` forces VPU decode with CPU fallback if unavailable (default: auto)
 - **mpp_decode_timeout_ms**: timeout (ms) waiting for a decoded frame from `mppjpegdec` (default: 40)
 - **enable**: whether to start YOLO enabled (default: False)
+- **max_process_rate_hz**: maximum YOLO image processing rate in Hz. Set `0.0` to disable rate limiting (default: 0.0)
 - **threshold**: detection threshold (default: 0.5)
 - **iou**: intersection Over Union (IoU) threshold for Non-Maximum Suppression (NMS) (default: 0.7)
 - **imgsz_height**: image height for inference (default: 480)
