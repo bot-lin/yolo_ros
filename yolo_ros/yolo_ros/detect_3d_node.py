@@ -16,6 +16,7 @@
 
 import cv2
 import numpy as np
+import threading
 from typing import List, Tuple, Optional
 
 import rclpy
@@ -35,7 +36,7 @@ from tf2_ros.transform_listener import TransformListener
 
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 from geometry_msgs.msg import TransformStamped
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header
 from yolo_msgs.msg import Detection
 from yolo_msgs.msg import DetectionArray
 from yolo_msgs.msg import KeyPoint3D
@@ -54,6 +55,8 @@ class Detect3DNode(LifecycleNode):
         self.declare_parameter("target_frame", "base_link")
         self.declare_parameter("maximum_detection_threshold", 0.3)
         self.declare_parameter("depth_image_units_divisor", 1000)
+        self.declare_parameter("enable", True)
+        self.declare_parameter("auto_follow_yolo_enable", True)
         self.declare_parameter(
             "depth_image_reliability", QoSReliabilityPolicy.BEST_EFFORT
         )
@@ -63,6 +66,8 @@ class Detect3DNode(LifecycleNode):
         self.tf_buffer = Buffer()
         self.cv_bridge = CvBridge()
         self._warned_pointcloud_mismatch = False
+        self._sync_lock = threading.Lock()
+        self._processing_subscriptions_active = False
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Configuring...")
@@ -79,6 +84,12 @@ class Detect3DNode(LifecycleNode):
             self.get_parameter("depth_image_units_divisor")
             .get_parameter_value()
             .integer_value
+        )
+        self.enable = self.get_parameter("enable").get_parameter_value().bool_value
+        self.auto_follow_yolo_enable = (
+            self.get_parameter("auto_follow_yolo_enable")
+            .get_parameter_value()
+            .bool_value
         )
         dimg_reliability = (
             self.get_parameter("depth_image_reliability")
@@ -119,26 +130,20 @@ class Detect3DNode(LifecycleNode):
     def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Activating...")
 
-        # subs
-        self.depth_sub = message_filters.Subscriber(
-            self, Image, "depth_image", qos_profile=self.depth_image_qos_profile
-        )
-        self.depth_info_sub = message_filters.Subscriber(
-            self, CameraInfo, "depth_info", qos_profile=self.depth_info_qos_profile
-        )
-        self.pointcloud_sub = message_filters.Subscriber(
-            self, PointCloud2, "pointcloud"
-        )
-        self.detections_sub = message_filters.Subscriber(
-            self, DetectionArray, "detections"
-        )
-
-        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
-            (self.depth_sub, self.depth_info_sub, self.pointcloud_sub, self.detections_sub),
-            10,
-            0.5,
-        )
-        self._synchronizer.registerCallback(self.on_detections)
+        self._enable_state_sub = None
+        if self.auto_follow_yolo_enable:
+            self._enable_state_sub = self.create_subscription(
+                Bool,
+                "enable_state",
+                self._enable_state_cb,
+                QoSProfile(
+                    reliability=QoSReliabilityPolicy.RELIABLE,
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                    depth=1,
+                ),
+            )
+        self._set_processing_enabled(self.enable)
 
         super().on_activate(state)
         self.get_logger().info(f"[{self.get_name()}] Activated")
@@ -148,12 +153,10 @@ class Detect3DNode(LifecycleNode):
     def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f"[{self.get_name()}] Deactivating...")
 
-        self.destroy_subscription(self.depth_sub.sub)
-        self.destroy_subscription(self.depth_info_sub.sub)
-        self.destroy_subscription(self.pointcloud_sub.sub)
-        self.destroy_subscription(self.detections_sub.sub)
-
-        del self._synchronizer
+        if self._enable_state_sub is not None:
+            self.destroy_subscription(self._enable_state_sub)
+            self._enable_state_sub = None
+        self._stop_processing_subscriptions()
 
         super().on_deactivate(state)
         self.get_logger().info(f"[{self.get_name()}] Deactivated")
@@ -184,6 +187,8 @@ class Detect3DNode(LifecycleNode):
         pointcloud_msg: PointCloud2,
         detections_msg: DetectionArray,
     ) -> None:
+        if not self.enable:
+            return
 
         new_detections_msg = DetectionArray()
         new_detections_msg.header = detections_msg.header
@@ -195,6 +200,57 @@ class Detect3DNode(LifecycleNode):
             points, pointcloud_msg.header.stamp, self.target_frame
         )
         self._pointcloud_pub.publish(pointcloud_msg)
+
+    def _enable_state_cb(self, msg: Bool) -> None:
+        self._set_processing_enabled(msg.data)
+
+    def _set_processing_enabled(self, enabled: bool) -> None:
+        with self._sync_lock:
+            if self.enable == enabled:
+                if self.enable and not self._processing_subscriptions_active:
+                    self._start_processing_subscriptions()
+                elif not self.enable and self._processing_subscriptions_active:
+                    self._stop_processing_subscriptions()
+                return
+            self.enable = enabled
+            if self.enable:
+                self.get_logger().info("3D processing enabled")
+                self._start_processing_subscriptions()
+            else:
+                self.get_logger().info("3D processing disabled")
+                self._stop_processing_subscriptions()
+
+    def _start_processing_subscriptions(self) -> None:
+        if self._processing_subscriptions_active:
+            return
+
+        self.depth_sub = message_filters.Subscriber(
+            self, Image, "depth_image", qos_profile=self.depth_image_qos_profile
+        )
+        self.depth_info_sub = message_filters.Subscriber(
+            self, CameraInfo, "depth_info", qos_profile=self.depth_info_qos_profile
+        )
+        self.pointcloud_sub = message_filters.Subscriber(self, PointCloud2, "pointcloud")
+        self.detections_sub = message_filters.Subscriber(self, DetectionArray, "detections")
+
+        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
+            (self.depth_sub, self.depth_info_sub, self.pointcloud_sub, self.detections_sub),
+            10,
+            0.5,
+        )
+        self._synchronizer.registerCallback(self.on_detections)
+        self._processing_subscriptions_active = True
+
+    def _stop_processing_subscriptions(self) -> None:
+        if not self._processing_subscriptions_active:
+            return
+
+        self.destroy_subscription(self.depth_sub.sub)
+        self.destroy_subscription(self.depth_info_sub.sub)
+        self.destroy_subscription(self.pointcloud_sub.sub)
+        self.destroy_subscription(self.detections_sub.sub)
+        del self._synchronizer
+        self._processing_subscriptions_active = False
 
     def process_detections(
         self,

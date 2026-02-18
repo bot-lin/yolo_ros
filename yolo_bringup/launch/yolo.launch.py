@@ -93,8 +93,16 @@ def generate_launch_description():
         enable = LaunchConfiguration("enable")
         enable_cmd = DeclareLaunchArgument(
             "enable",
-            default_value="True",
+            default_value="False",
             description="Whether to start YOLO enabled",
+        )
+
+        auto_follow_yolo_enable = LaunchConfiguration("auto_follow_yolo_enable")
+        auto_follow_yolo_enable_cmd = DeclareLaunchArgument(
+            "auto_follow_yolo_enable",
+            default_value="True",
+            choices=["True", "False"],
+            description="Whether detect_3d_node follows yolo_node enable state",
         )
 
         threshold = LaunchConfiguration("threshold")
@@ -342,11 +350,13 @@ def generate_launch_description():
             namespace=namespace,
             parameters=[
                 {
+                    "enable": enable,
                     "target_frame": target_frame,
                     "maximum_detection_threshold": maximum_detection_threshold,
                     "depth_image_units_divisor": depth_image_units_divisor,
                     "depth_image_reliability": depth_image_reliability,
                     "depth_info_reliability": depth_info_reliability,
+                    "auto_follow_yolo_enable": auto_follow_yolo_enable,
                 }
             ],
             remappings=[
@@ -400,6 +410,7 @@ def generate_launch_description():
             compressed_decode_backend_cmd,
             mpp_decode_timeout_ms_cmd,
             enable_cmd,
+            auto_follow_yolo_enable_cmd,
             threshold_cmd,
             iou_cmd,
             imgsz_height_cmd,

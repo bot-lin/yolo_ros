@@ -133,6 +133,7 @@ ros2 launch yolo_bringup yoloe.launch.py
 - **/yolo/tracking**: Objects detected and tracked from YOLO results. Each object is assigned a tracking ID.
 - **/yolo/detections_3d**: 3D objects detected. YOLO results are used to crop the depth images to create the 3D bounding boxes and 3D keypoints.
 - **/yolo/debug_image**: Debug images showing the detected and tracked objects. They can be visualized with rviz2.
+- **/yolo/enable_state**: Current enable state of `yolo_node` (`std_msgs/Bool`). `detect_3d_node` can auto-follow this state.
 
 ### Parameters
 
@@ -146,7 +147,7 @@ These are the parameters from the [yolo.launch.py](./yolo_bringup/launch/yolo.la
 - **image_is_compressed**: subscribe to `sensor_msgs/CompressedImage` instead of `sensor_msgs/Image` (default: False)
 - **compressed_decode_backend**: compressed decode backend. `auto` tries RK3588 VPU (`mppjpegdec`) first, then CPU fallback. `cpu` forces OpenCV decode. `vpu_mpp` forces VPU decode with CPU fallback if unavailable (default: auto)
 - **mpp_decode_timeout_ms**: timeout (ms) waiting for a decoded frame from `mppjpegdec` (default: 40)
-- **enable**: whether to start YOLO enabled (default: True)
+- **enable**: whether to start YOLO enabled (default: False)
 - **threshold**: detection threshold (default: 0.5)
 - **iou**: intersection Over Union (IoU) threshold for Non-Maximum Suppression (NMS) (default: 0.7)
 - **imgsz_height**: image height for inference (default: 480)
@@ -165,6 +166,7 @@ These are the parameters from the [yolo.launch.py](./yolo_bringup/launch/yolo.la
 - **target_frame**: frame to transform the 3D boxes (default: base_link)
 - **depth_image_units_divisor**: divisor to convert the depth image into meters (default: 1000)
 - **maximum_detection_threshold**: maximum detection threshold in the z-axis (default: 0.3)
+- **auto_follow_yolo_enable**: whether `detect_3d_node` follows `/yolo/enable_state` and skips processing when YOLO is disabled (default: True)
 - **use_tracking**: whether to activate tracking after detection (default: True)
 - **use_3d**: whether to activate 3D detections (default: False)
 - **use_debug**: whether to activate debug node (default: True)

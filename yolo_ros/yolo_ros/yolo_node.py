@@ -37,6 +37,7 @@ from ultralytics.engine.results import Masks
 from ultralytics.engine.results import Keypoints
 
 from std_srvs.srv import SetBool
+from std_msgs.msg import Bool
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import CompressedImage
 from yolo_msgs.msg import Point2D
@@ -251,6 +252,17 @@ class YoloNode(LifecycleNode):
 
 
         self._enable_srv = self.create_service(SetBool, "enable", self.enable_cb)
+        self._enable_state_pub = self.create_publisher(
+            Bool,
+            "enable_state",
+            QoSProfile(
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            ),
+        )
+        self._publish_enable_state()
 
         if isinstance(self.yolo, YOLOWorld):
             self._set_classes_srv = self.create_service(
@@ -287,6 +299,9 @@ class YoloNode(LifecycleNode):
 
         self.destroy_service(self._enable_srv)
         self._enable_srv = None
+
+        self.destroy_publisher(self._enable_state_pub)
+        self._enable_state_pub = None
 
         if is_world_model:
             self.destroy_service(self._set_classes_srv)
@@ -328,8 +343,14 @@ class YoloNode(LifecycleNode):
         response: SetBool.Response,
     ) -> SetBool.Response:
         self.enable = request.data
+        self._publish_enable_state()
         response.success = True
         return response
+
+    def _publish_enable_state(self) -> None:
+        msg = Bool()
+        msg.data = self.enable
+        self._enable_state_pub.publish(msg)
 
     def _setup_compressed_decoder(self) -> None:
         if self.compressed_decode_backend not in {"auto", "cpu", "vpu_mpp"}:
